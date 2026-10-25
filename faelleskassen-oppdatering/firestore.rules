@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Alt ligger under households/<delekode>. Uten riktig kode finnes det ingen vei inn,
+    // og det er ikke mulig å liste opp andres regnskap.
+    match /households/{hid}/{document=**} {
+      allow read, write: if hid.size() >= 20;
+    }
+  }
+}
