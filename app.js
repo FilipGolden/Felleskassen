@@ -60,7 +60,7 @@ const configured = () => !!(firebaseConfig && firebaseConfig.apiKey && firebaseC
 
 const state = {
   mode: 'init', canWrite: true, online: navigator.onLine, error: '',
-  people: {}, expenses: {}, settlements: {},
+  people: {}, expenses: {}, settlements: {}, recurring: {}, runs: {}, srv: {},
   month: monthOf(todayStr()), tab: 'utgifter', loaded: { people: false },
   confirmClose: false, confirmReopen: false, shareAfter: false
 };
@@ -93,12 +93,17 @@ async function makeCloudStore(hid) {
       fs.onSnapshot(col('people'), { includeMetadataChanges: true }, (s) => {
         state.people = toMap(s);
         if (!s.metadata.fromCache || !s.empty) state.loaded.people = true;
+        state.srv.people = !s.metadata.fromCache;
         state.error = '';
+        ensureRecurring();
         afterPeople();
         render();
       }, onErr);
-      fs.onSnapshot(col('expenses'), (s) => { state.expenses = toMap(s); render(); }, onErr);
-      fs.onSnapshot(col('settlements'), (s) => { state.settlements = toMap(s); render(); }, onErr);
+      // Faste utgifter legges bare inn når vi har fått svar fra serveren, ikke fra en gammel hurtigbuffer.
+      const watch = (name) => fs.onSnapshot(col(name), { includeMetadataChanges: true }, (s) => {
+        state[name] = toMap(s); state.srv[name] = !s.metadata.fromCache; ensureRecurring(); render();
+      }, onErr);
+      ['expenses', 'settlements', 'recurring', 'runs'].forEach(watch);
     },
     addExpense: (o) => guard(fs.setDoc(fs.doc(col('expenses')), o)),
     setExpense: (id, o) => guard(fs.setDoc(ref('expenses', id), o)),
@@ -106,22 +111,28 @@ async function makeCloudStore(hid) {
     setPerson: (id, o) => guard(fs.setDoc(ref('people', id), o)),
     setSettlement: (m, o) => guard(fs.setDoc(ref('settlements', m), o)),
     updateSettlement: (m, p) => guard(fs.updateDoc(ref('settlements', m), p)),
-    deleteSettlement: (m) => guard(fs.deleteDoc(ref('settlements', m)))
+    deleteSettlement: (m) => guard(fs.deleteDoc(ref('settlements', m))),
+    setRecurring: (id, o) => guard(fs.setDoc(ref('recurring', id), o)),
+    deleteRecurring: (id) => guard(fs.deleteDoc(ref('recurring', id))),
+    setRun: (id, o) => guard(fs.setDoc(ref('runs', id), o))
   };
 }
 
 /* ---------- lagring: bare denne enheten (når Firebase ikke er satt opp) ---------- */
 function makeLocalStore() {
   const KEY = 'faelleskassen-local-v1';
-  let data = { people: {}, expenses: {}, settlements: {} };
-  try { const raw = localStorage.getItem(KEY); if (raw) { const p = JSON.parse(raw); data.people = p.people || {}; data.expenses = p.expenses || {}; data.settlements = p.settlements || {}; } } catch (e) { /* tom */ }
-  if (!data.people.a) data.people.a = { name: 'S', joinedAt: 1 };
-  if (!data.people.b) data.people.b = { name: 'F', joinedAt: 2 };
+  let data = { people: {}, expenses: {}, settlements: {}, recurring: {}, runs: {} };
+  try { const raw = localStorage.getItem(KEY); if (raw) { const p = JSON.parse(raw); data.people = p.people || {}; data.expenses = p.expenses || {}; data.settlements = p.settlements || {}; data.recurring = p.recurring || {}; data.runs = p.runs || {}; } } catch (e) { /* tom */ }
+  if (!data.people.a) data.people.a = { name: 'Person 1', joinedAt: 1 };
+  if (!data.people.b) data.people.b = { name: 'Person 2', joinedAt: 2 };
   const withId = (m) => { const o = {}; Object.keys(m).forEach((k) => { o[k] = Object.assign({}, m[k], { id: k }); }); return o; };
   const sync = () => {
     try { localStorage.setItem(KEY, JSON.stringify(data)); } catch (e) { /* ingen lagring */ }
     state.people = withId(data.people); state.expenses = withId(data.expenses); state.settlements = withId(data.settlements);
+    state.recurring = withId(data.recurring); state.runs = withId(data.runs);
+    state.srv = { people: true, expenses: true, settlements: true, recurring: true, runs: true };
     state.loaded.people = true;
+    ensureRecurring();
     render();
   };
   const newId = () => 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -134,7 +145,10 @@ function makeLocalStore() {
     setPerson(id, o) { data.people[id] = o; sync(); return Promise.resolve(); },
     setSettlement(m, o) { data.settlements[m] = o; sync(); return Promise.resolve(); },
     updateSettlement(m, p) { data.settlements[m] = Object.assign({}, data.settlements[m], p); sync(); return Promise.resolve(); },
-    deleteSettlement(m) { delete data.settlements[m]; sync(); return Promise.resolve(); }
+    deleteSettlement(m) { delete data.settlements[m]; sync(); return Promise.resolve(); },
+    setRecurring(id, o) { data.recurring[id] = o; sync(); return Promise.resolve(); },
+    deleteRecurring(id) { delete data.recurring[id]; sync(); return Promise.resolve(); },
+    setRun(id, o) { data.runs[id] = o; sync(); return Promise.resolve(); }
   };
 }
 
@@ -167,6 +181,30 @@ function calcTransfer(ids, totals) {
   if (diff === 0) return { amountOre: 0, fromId: null, toId: null };
   const amt = Math.round(Math.abs(diff) / 2);
   return diff > 0 ? { amountOre: amt, fromId: b, toId: a } : { amountOre: amt, fromId: a, toId: b };
+}
+/* Faste utgifter: legges inn én gang per måned. Utgiften får en fast id og en «kjørt»-markør,
+   så to telefoner aldri lager dobbelt, og en slettet utgift kommer ikke tilbake. */
+const genDone = new Set();
+function ensureRecurring() {
+  if (!store || !namesOk()) return;
+  const v = state.srv;
+  if (!(v.people && v.expenses && v.settlements && v.recurring && v.runs)) return;
+  const cur = monthOf(todayStr()), floor = shiftMonth(cur, -11), todo = [];
+  Object.keys(state.recurring).forEach((rid) => {
+    const r = state.recurring[rid];
+    if (!r || !(r.amountOre > 0) || !state.people[r.payerId]) return;
+    for (let m = r.startMonth < floor ? floor : r.startMonth; m <= cur; m = shiftMonth(m, 1)) {
+      const key = rid + '_' + m;
+      if (genDone.has(key) || state.runs[key] || state.settlements[m]) continue;
+      todo.push({ rid, r, m, key });
+    }
+  });
+  todo.forEach((t) => { genDone.add(t.key); });
+  todo.forEach((t) => {
+    const now = Date.now();
+    store.setExpense('r_' + t.key, { amountOre: t.r.amountOre, category: t.r.category, note: t.r.note || '', date: t.m + '-' + pad(Math.min(28, Math.max(1, t.r.day || 1))), month: t.m, payerId: t.r.payerId, addedBy: 'auto', createdAt: now, recurringId: t.rid });
+    store.setRun(t.key, { recurringId: t.rid, month: t.m, createdAt: now });
+  });
 }
 function pendingSettlements() {
   return Object.keys(state.settlements).map((m) => [m, state.settlements[m]])
@@ -249,14 +287,35 @@ function listCard(d) {
   let h = '<section class="card"><div class="label">Utgifter</div>', last = '';
   sorted.forEach((e) => {
     if (e.date !== last) { if (last) h += '</div>'; h += '<h3 class="day">' + esc(dayLabel(e.date)) + '</h3><div class="list">'; last = e.date; }
-    h += '<button class="row" data-act="edit" data-id="' + esc(e.id) + '"><span class="row-main"><span class="row-cat">' + esc(e.category) + '</span>' + (e.note ? '<span class="row-note">' + esc(e.note) + '</span>' : '') + '</span><span class="row-side"><span class="num">' + fmt(e.amountOre) + '</span>' + payerHtml(e.payerId) + '</span></button>';
+    h += '<button class="row" data-act="edit" data-id="' + esc(e.id) + '"><span class="row-main"><span class="row-cat">' + esc(e.category) + (e.recurringId ? ' <span class="chip-s tag">Fast</span>' : '') + '</span>' + (e.note ? '<span class="row-note">' + esc(e.note) + '</span>' : '') + '</span><span class="row-side"><span class="num">' + fmt(e.amountOre) + '</span>' + payerHtml(e.payerId) + '</span></button>';
   });
   return h + '</div></section>';
 }
 
+function recStatus(r) {
+  const cur = monthOf(todayStr());
+  if (state.runs[r.id + '_' + cur]) return 'lagt inn i ' + monthName(cur);
+  if (r.startMonth > cur) return 'første gang i ' + monthName(r.startMonth);
+  if (state.settlements[cur]) return cap(monthName(cur)) + ' er gjort opp, kommer i ' + monthName(shiftMonth(cur, 1));
+  return 'legges inn nå';
+}
+
+function recurringCard() {
+  const items = Object.keys(state.recurring).map((k) => state.recurring[k]).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  let h = '<section class="card"><div class="label">Faste utgifter</div>';
+  if (!items.length) {
+    h += '<div class="small muted">Husleie, internett og annet som kommer hver måned. Legg dem inn én gang, så føres de automatisk.</div>';
+  } else {
+    const sum = items.reduce((a, r) => a + r.amountOre, 0);
+    h += '<div class="small muted">Legges inn automatisk hver måned · ' + fmt(sum) + ' DKK til sammen</div><div class="list">' +
+      items.map((r) => '<button class="row" data-act="rec-edit" data-id="' + esc(r.id) + '"><span class="row-main"><span class="row-cat">' + esc(r.category) + '</span><span class="row-note">' + esc(r.note ? r.note + ' · ' : '') + 'den ' + (r.day || 1) + '. hver måned · ' + esc(recStatus(r)) + '</span></span><span class="row-side"><span class="num">' + fmt(r.amountOre) + '</span>' + payerHtml(r.payerId) + '</span></button>').join('') + '</div>';
+  }
+  return h + '<button class="btn ghost" data-act="rec-new">' + (items.length ? 'Ny fast utgift' : 'Legg til fast utgift') + '</button></section>';
+}
+
 function viewExpenses() {
   const m = state.month, d = monthData(m), st = state.settlements[m];
-  return noticeHtml() + pendingBanners() + summaryCard(d, st) + categoryCard(d) + listCard(d);
+  return noticeHtml() + pendingBanners() + summaryCard(d, st) + categoryCard(d) + listCard(d) + (couple().length ? recurringCard() : '');
 }
 
 function viewSettle() {
@@ -297,6 +356,47 @@ function viewSettle() {
   return h;
 }
 
+const catColor = (c) => { const i = CATS.indexOf(c); return 'var(--c' + (i < 0 ? CATS.length - 1 : i) + ')'; };
+
+function donutHtml(ents, total) {
+  const R = 73, C = 2 * Math.PI * R;
+  let cum = 0, circles = '';
+  ents.forEach((e) => {
+    const len = e[1] / total * C, gap = ents.length > 1 ? Math.min(1.6, len / 2) : 0;
+    circles += '<circle cx="100" cy="100" r="' + R + '" fill="none" stroke-width="34" style="stroke:' + catColor(e[0]) + '" stroke-dasharray="' + (len - gap).toFixed(2) + ' ' + (C - len + gap).toFixed(2) + '" stroke-dashoffset="' + (-cum).toFixed(2) + '"/>';
+    cum += len;
+  });
+  return '<div class="donut"><svg viewBox="0 0 200 200" role="img" aria-label="Kakediagram over utgifter per kategori"><g transform="rotate(-90 100 100)">' + circles + '</g></svg>' +
+    '<div class="donut-c"><span class="num">' + fmt(total) + '</span><span class="muted small">DKK</span></div></div>';
+}
+
+function viewChart() {
+  const m = state.month, d = monthData(m);
+  let h = noticeHtml();
+  const ents = Object.keys(d.byCat).map((k) => [k, d.byCat[k]]).sort((a, b) => b[1] - a[1]);
+  h += '<section class="card"><div class="label">Brukt på hva i ' + esc(monthName(m)) + '</div>';
+  if (!ents.length) {
+    h += '<div class="empty"><h3>Ingen utgifter i ' + esc(monthName(m)) + '</h3><p>Velg en annen måned øverst, eller legg inn utgifter under Utgifter.</p></div></section>';
+  } else {
+    h += donutHtml(ents, d.total) + '<div class="legend-list">' + ents.map((e) => {
+      const pct = e[1] / d.total * 100;
+      return '<div class="lrow"><i class="dot" style="background:' + catColor(e[0]) + '"></i><span class="lname">' + esc(e[0]) + '</span><span class="muted small">' + (pct < 1 ? '<1' : Math.round(pct)) + ' %</span><span class="num">' + fmt(e[1]) + '</span></div>';
+    }).join('') + '</div></section>';
+  }
+  // Alle måneder med totalt brukt
+  const set = {}; set[monthOf(todayStr())] = 1;
+  Object.keys(state.expenses).forEach((k) => { const mm = state.expenses[k].month; if (mm) set[mm] = 1; });
+  const months = Object.keys(set).sort().reverse();
+  const rows = months.map((mm) => [mm, monthData(mm).total]);
+  const max = Math.max.apply(null, rows.map((r) => r[1]).concat([1]));
+  const nonEmpty = rows.filter((r) => r[1] > 0);
+  const sum = nonEmpty.reduce((a, r) => a + r[1], 0);
+  h += '<section class="card"><div class="label">Totalt brukt per måned</div>';
+  if (nonEmpty.length > 1) h += '<div class="small muted">Snitt ' + fmt(Math.round(sum / nonEmpty.length)) + ' DKK per måned · til sammen ' + fmt(sum) + ' DKK</div>';
+  h += '<div>' + rows.map((r) => '<button class="mrow mpick" data-act="pick-month" data-m="' + esc(r[0]) + '"' + (r[0] === m ? ' aria-current="true"' : '') + '><span class="mcol"><span class="cap">' + esc(monthLabel(r[0])) + '</span><span class="bar"><b style="width:' + (r[1] ? Math.max(3, r[1] / max * 100) : 0) + '%"></b></span></span><span class="num">' + fmt(r[1]) + ' DKK</span></button>').join('') + '</div></section>';
+  return h;
+}
+
 function viewMonths() {
   const set = {}; set[monthOf(todayStr())] = 1;
   Object.keys(state.expenses).forEach((k) => { const m = state.expenses[k].month; if (m) set[m] = 1; });
@@ -324,14 +424,14 @@ function render() {
   let v;
   if (state.mode === 'init' || state.mode === 'welcome' || (state.mode === 'cloud' && !state.loaded.people && !state.error)) v = viewLoading;
   else if (state.mode === 'error') v = viewError;
-  else v = { utgifter: viewExpenses, oppgjor: viewSettle, maaneder: viewMonths }[state.tab];
+  else v = { utgifter: viewExpenses, oppgjor: viewSettle, diagram: viewChart, maaneder: viewMonths }[state.tab];
   $('#view').innerHTML = v();
   document.querySelectorAll('.tab').forEach((b) => {
     if (b.dataset.tab === state.tab) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   });
   $('#tab-oppgjor').classList.toggle('has-alert', pendingSettlements().length > 0);
   const ready = (state.mode === 'cloud' && state.loaded.people) || state.mode === 'local';
-  $('#fab').hidden = !(ready && state.tab !== 'oppgjor');
+  $('#fab').hidden = !(ready && state.tab === 'utgifter' || state.tab === 'maaneder');
 }
 
 /* ---------- ark (bottom sheets) ---------- */
@@ -393,6 +493,7 @@ async function saveExpense() {
   const month = monthOf(date), old = sheet.id ? state.expenses[sheet.id] : null;
   if (state.settlements[month] || (old && state.settlements[old.month])) return formErr('Måneden er gjort opp. Åpne den igjen under Oppgjør for å endre utgifter.');
   const obj = { amountOre: ore, category: sheet.cat, note, date, month, payerId: sheet.payer, addedBy: cfg.me || sheet.payer, createdAt: old ? old.createdAt : Date.now() };
+  if (old && old.recurringId) obj.recurringId = old.recurringId;
   const btn = $('#f-save'); btn.disabled = true;
   const id = sheet.id;
   const ok = await run(() => (id ? store.setExpense(id, obj) : store.addExpense(obj)), id ? 'Endringen er lagret' : 'Utgiften er lagret');
@@ -409,11 +510,68 @@ async function deleteExpense() {
   if (ok) { closeSheet(); render(); }
 }
 
+function openRecurringEdit(id) {
+  const r = id ? state.recurring[id] : null;
+  if (id && !r) return;
+  const ps = couple();
+  const mine = ps.some((p) => p.id === cfg.me) ? cfg.me : (ps[0] && ps[0].id);
+  const cur = monthOf(todayStr());
+  sheet = { type: 'rec-edit', id: id || null, cat: r ? r.category : CATS[0], payer: r ? r.payerId : mine, start: state.settlements[cur] ? 'next' : 'this', confirmDel: false };
+  const amt = r ? (r.amountOre / 100).toFixed(2).replace('.', ',') : '';
+  let h = sheetHead(r ? 'Rediger fast utgift' : 'Ny fast utgift', true) +
+    '<label class="field-l" for="f-amount">Beløp hver måned</label>' +
+    '<div class="amt"><input id="f-amount" inputmode="decimal" autocomplete="off" placeholder="0,00" value="' + esc(amt) + '"><span class="cur num">DKK</span></div>' +
+    '<div class="field-l">Kategori</div><div class="chips" id="f-cats">' + CATS.map((c) => '<button type="button" class="chip" data-act="pick-cat" data-v="' + esc(c) + '" aria-pressed="' + (c === sheet.cat) + '">' + esc(c) + '</button>').join('') + '</div>' +
+    '<label class="field-l" for="f-note">Notat (valgfritt)</label>' +
+    '<input id="f-note" class="inp" maxlength="80" autocomplete="off" placeholder="For eksempel Husleie eller Internett" value="' + esc(r ? r.note : '') + '">' +
+    '<label class="field-l" for="f-day">Dag i måneden (1 til 28)</label>' +
+    '<input id="f-day" class="inp" type="number" inputmode="numeric" min="1" max="28" value="' + (r ? (r.day || 1) : 1) + '">' +
+    '<div class="field-l">Betalt av</div><div class="chips" id="f-payers">' + ps.map((p) => '<button type="button" class="chip" data-act="pick-payer" data-v="' + esc(p.id) + '" aria-pressed="' + (p.id === sheet.payer) + '"><i class="dot" style="background:' + colorOf(p.id) + '"></i>' + esc(p.name) + '</button>').join('') + '</div>';
+  if (!r) {
+    h += '<div class="field-l">Første gang</div><div class="chips" id="f-start">' +
+      '<button type="button" class="chip" data-act="pick-start" data-v="this" aria-pressed="' + (sheet.start === 'this') + '">Denne måneden (' + esc(monthName(cur)) + ')</button>' +
+      '<button type="button" class="chip" data-act="pick-start" data-v="next" aria-pressed="' + (sheet.start === 'next') + '">Neste måned (' + esc(monthName(shiftMonth(cur, 1))) + ')</button></div>' +
+      (state.settlements[cur] ? '<div class="note">' + esc(cap(monthName(cur))) + ' er gjort opp, så utgiften kan ikke legges inn der. Åpne måneden igjen under Oppgjør hvis den skal være med.</div>' : '');
+  } else {
+    h += '<div class="note">Endringer gjelder neste gang utgiften legges inn. Utgifter som allerede er lagt inn, beholdes.</div>';
+  }
+  h += '<p class="ferr" id="ferr" role="alert" hidden></p>' +
+    '<div class="sheet-actions"><button class="btn" id="f-save" data-act="save-rec">Lagre</button>' + (r ? '<button class="btn ghost danger" id="f-del" data-act="delete-rec">Slett fast utgift</button>' : '') + '<button class="btn ghost" data-act="sheet-close">Avbryt</button></div>';
+  openSheet(h);
+  if (!r) setTimeout(() => { try { $('#f-amount').focus(); } catch (e2) { /* ingen fokus */ } }, 60);
+}
+
+async function saveRecurring() {
+  if (!sheet || sheet.type !== 'rec-edit') return;
+  const ore = parseAmount($('#f-amount').value);
+  const day = parseInt($('#f-day').value, 10);
+  if (!ore) return formErr('Skriv inn et beløp, for eksempel 8500,00.');
+  if (!(day >= 1 && day <= 28)) return formErr('Dagen må være et tall mellom 1 og 28.');
+  if (!sheet.payer) return formErr('Velg hvem som betaler.');
+  const old = sheet.id ? state.recurring[sheet.id] : null, cur = monthOf(todayStr());
+  const id = sheet.id || ('f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
+  const obj = { amountOre: ore, category: sheet.cat, note: $('#f-note').value.trim().slice(0, 80), day, payerId: sheet.payer, startMonth: old ? old.startMonth : (sheet.start === 'this' ? cur : shiftMonth(cur, 1)), createdAt: old ? old.createdAt : Date.now() };
+  $('#f-save').disabled = true;
+  const ok = await run(() => store.setRecurring(id, obj), 'Fast utgift lagret');
+  if (!ok) { if ($('#f-save')) $('#f-save').disabled = false; return; }
+  state.recurring[id] = Object.assign({ id }, obj);
+  ensureRecurring();
+  closeSheet(); render();
+}
+
+async function deleteRecurring() {
+  if (!sheet || !sheet.id) return;
+  if (!sheet.confirmDel) { sheet.confirmDel = true; $('#f-del').textContent = 'Trykk igjen for å slette'; return; }
+  const id = sheet.id;
+  const ok = await run(() => store.deleteRecurring(id), 'Fast utgift slettet');
+  if (ok) { delete state.recurring[id]; closeSheet(); render(); }
+}
+
 function nameInputs() {
   const na = state.people.a && state.people.a.name ? state.people.a.name : '';
   const nb = state.people.b && state.people.b.name ? state.people.b.name : '';
-  return '<label class="field-l" for="n-a">S</label><input id="n-a" class="inp" maxlength="24" autocomplete="off" value="' + esc(na) + '">' +
-    '<label class="field-l" for="n-b">F</label><input id="n-b" class="inp" maxlength="24" autocomplete="off" value="' + esc(nb) + '">';
+  return '<label class="field-l" for="n-a">Person 1</label><input id="n-a" class="inp" maxlength="24" autocomplete="off" value="' + esc(na) + '">' +
+    '<label class="field-l" for="n-b">Person 2</label><input id="n-b" class="inp" maxlength="24" autocomplete="off" value="' + esc(nb) + '">';
 }
 
 function openNames(first) {
@@ -587,6 +745,7 @@ document.addEventListener('click', (ev) => {
     case 'add': if (couple().length === 0) { openNames(false); return; } openExpense(null); return;
     case 'edit': openExpense(el.dataset.id); return;
     case 'settings': openSettings(); return;
+    case 'pick-month': state.month = el.dataset.m; resetConfirms(); render(); return;
     case 'goto-month': state.month = el.dataset.m; state.tab = 'utgifter'; resetConfirms(); render(); window.scrollTo(0, 0); return;
     case 'goto-settle': state.month = el.dataset.m; state.tab = 'oppgjor'; resetConfirms(); render(); window.scrollTo(0, 0); return;
     case 'close-month': closeMonth(); return;
@@ -597,6 +756,15 @@ document.addEventListener('click', (ev) => {
       const m = state.month; state.confirmReopen = false;
       run(() => store.deleteSettlement(m), 'Måneden er åpnet igjen').then(render); return;
     }
+    case 'rec-list': closeSheet(); return;
+    case 'rec-new': openRecurringEdit(null); return;
+    case 'rec-edit': openRecurringEdit(el.dataset.id); return;
+    case 'pick-start':
+      sheet.start = el.dataset.v;
+      document.querySelectorAll('#f-start .chip').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === sheet.start)));
+      return;
+    case 'save-rec': saveRecurring(); return;
+    case 'delete-rec': deleteRecurring(); return;
     case 'create-household': createHousehold(); return;
     case 'join-household': joinHousehold(); return;
     case 'reset-code': leaveHousehold(); return;

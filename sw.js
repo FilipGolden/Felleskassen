@@ -1,6 +1,6 @@
 // Service worker: gjør at appen åpnes uten nett etter første besøk.
 // Egne filer hentes fra nett først (så oppdateringer kommer med), med lagret kopi som reserve.
-const CACHE = 'faelleskassen-v1';
+const CACHE = 'faelleskassen-v5';
 const CORE = ['./', 'index.html', 'styles.css', 'app.js', 'firebase-config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 const CROSS = ['www.gstatic.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];
